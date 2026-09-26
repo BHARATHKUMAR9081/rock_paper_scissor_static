@@ -100,18 +100,14 @@ jobs:
           set -euo pipefail
           aws --version
           aws sts get-caller-identity
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URI" | cut -d'/' -f1)"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
       - name: Push image to Amazon ECR
         run: |
           set -euo pipefail
           docker push "$IMAGE_URI"
-          aws ecr describe-images \
-            --repository-name "${ECR_REPOSITORY_URI##*/}" \
-            --image-ids imageTag="${{ steps.meta.outputs.image_tag }}" \
-            --region "$AWS_REGION" || true
+          echo "Pushed $IMAGE_URI"
 
   deploy-to-ec2:
     needs: build-and-push
@@ -120,26 +116,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deploy image on EC2 instance via SSM send-command
-        run: |
-          set -euo pipefail
-          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
-          {
-            "commands": [
-              "set -euo pipefail",
-              "export AWS_REGION=ap-south-1",
-              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "IMAGE_URI=" + "" + "",
-              "true"
-            ]
-          }
-          SSMPARAMS
-          echo "placeholder" > /dev/null
-        env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
-
-      - name: Run remote deployment via SSM
+      - name: Deploy to EC2 instance via SSM RunShellScript
         run: |
           set -euo pipefail
           IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
@@ -147,31 +124,20 @@ jobs:
           {
             "commands": [
               "set -euo pipefail",
-              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin ${ECR_REPOSITORY_URI%%/*}",
+              "export AWS_REGION=$AWS_REGION",
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY_URI",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app -e PORT=80 $IMAGE_URI"
             ]
           }
           SSMPARAMS
-          echo "--- SSM parameters payload ---"
-          cat /tmp/ssm-params.json
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=$COMMAND_ID"
-          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "SSM CommandId: $COMMAND_ID"
           STATUS="InProgress"
           for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" --output text || echo "Pending")
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "Status" --output text || echo "Pending")
             echo "SSM status: $STATUS"
             case "$STATUS" in
               Success) break ;;
@@ -180,43 +146,39 @@ jobs:
             esac
           done
           [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed"; exit 1; }
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "StandardOutputContent" --output text || true
 
-  verify-deployment:
-    needs: [build-and-push, deploy-to-ec2]
+  verify-production:
+    needs: deploy-to-ec2
     runs-on: ubuntu-latest
     steps:
-      - name: Health check public URL until HTTP 200
+      - name: Health check public URL (HTTP 200 required)
         run: |
           set -euo pipefail
           CODE="000"
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/" || true)
-            echo "Attempt $i: HTTP $CODE"
             [ "$CODE" = "200" ] && break
             sleep 5
           done
-          if [ "$CODE" != "200" ]; then
-            echo "Health check failed: expected HTTP 200, got $CODE"
-            exit 1
-          fi
+          echo "Production HTTP status: $CODE"
+          if [ "$CODE" != "200" ]; then echo "Health check failed"; exit 1; fi
           BODY=$(curl -s "$PUBLIC_URL/")
-          echo "$BODY" | head -n 20
           echo "$BODY" | grep -qi "Rock Paper Scissor" && echo "Content check OK"
-          echo "Deployment verified at $PUBLIC_URL"
 
-      - name: Emit deployment outputs
+  output-targets:
+    needs: [build-and-push, deploy-to-ec2, verify-production]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Emit deployment targets
         run: |
           set -euo pipefail
-          echo "public_ip=13.204.136.169"
-          echo "public_url=http://13.204.136.169"
-          echo "alb_dns_name=13.204.136.169"
-          echo "instance_id=i-0636d6d516e700271"
-          echo "ecr_repo_url=759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati"
-          echo "security_group_id=sg-0bbe7f166528c56cd"
-          echo "iam_instance_profile=rock-paper-scissor-stati-instance-profile"
-          echo "iam_role=rock-paper-scissor-stati-ec2-role"
+          {
+            echo "public_ip=13.204.136.169"
+            echo "public_url=http://13.204.136.169"
+            echo "alb_dns_name=13.204.136.169"
+            echo "instance_id=i-0636d6d516e700271"
+            echo "ecr_repo_url=759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati"
+            echo "security_group_id=sg-0bbe7f166528c56cd"
+            echo "iam_instance_profile=rock-paper-scissor-stati-instance-profile"
+            echo "iam_role=rock-paper-scissor-stati-ec2-role"
+          } >> "$GITHUB_OUTPUT"
