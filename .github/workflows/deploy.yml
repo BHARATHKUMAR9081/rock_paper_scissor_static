@@ -1,0 +1,175 @@
+name: build-deploy-verify-rock-paper-scissors
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati
+  INSTANCE_ID: i-0636d6d516e700271
+  SECRET_MANAGER_ID: deptic/rock_paper_scissor_static/secrets
+  CONTAINER_PORT: "8000"
+  PUBLIC_URL: http://13.204.136.169
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build diagnostics - inventory static assets
+        run: |
+          set -euo pipefail
+          echo "--- Repository root ---"
+          ls -la
+          echo "--- Required game assets ---"
+          test -f index.html && echo "index.html OK"
+          test -f script.js && echo "script.js OK"
+          test -f style.css && echo "style.css OK"
+          test -d images && echo "images/ OK" || echo "WARNING: images/ directory missing"
+          node --check script.js && echo "script.js syntax OK"
+
+      - name: Generate Dockerfile for static site (context ., port 8000)
+        run: |
+          set -euo pipefail
+          cat > Dockerfile << 'DOCKERFILE'
+          FROM python:3.11-alpine
+          WORKDIR /usr/share/www
+          COPY index.html script.js style.css ./
+          COPY images ./images/
+          EXPOSE 8000
+          CMD ["sh", "-c", "python3 -m http.server ${PORT:-8000} --bind 0.0.0.0"]
+          DOCKERFILE
+          echo "--- Dockerfile ---"
+          cat Dockerfile
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag and URI
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+          IMAGE_URI="$ECR_REPOSITORY_URI:$IMAGE_TAG"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          echo "Building image: $IMAGE_URI"
+
+      - name: Build Docker image
+        run: |
+          set -euo pipefail
+          docker build -t "$IMAGE_URI" -f Dockerfile .
+          docker images "$IMAGE_URI"
+
+      - name: Smoke test container locally on port 8000
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -e PORT=8000 -p 8000:8000 "$IMAGE_URI"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ || true)
+            [ "$CODE" = "200" ] && break
+            sleep 2
+          done
+          echo "Local smoke test HTTP status: $CODE"
+          CURL_OUT=$(curl -s http://localhost:8000/)
+          echo "$CURL_OUT" | head -n 20
+          docker logs smoke
+          docker rm -f smoke
+          if [ "$CODE" != "200" ]; then echo "Smoke test failed"; exit 1; fi
+          echo "$CURL_OUT" | grep -qi "Rock Paper Scissor" && echo "Content check OK"
+
+      - name: Authenticate to AWS CLI and Amazon ECR
+        run: |
+          set -euo pipefail
+          aws --version
+          aws sts get-caller-identity
+          ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URI" | cut -d'/' -f1)"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Push image to Amazon ECR
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_URI"
+          docker push "$ECR_REPOSITORY_URI:latest" || true
+          aws ecr describe-images --repository-name "$(echo "$ECR_REPOSITORY_URI" | cut -d'/' -f2-)" --region "$AWS_REGION" --query 'length(imageDetails)' --output text
+
+  deploy-to-ec2:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy image to EC2 instance via SSM RunShellScript
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+        run: |
+          set -euo pipefail
+          ECR_REGISTRY="$(echo "$ECR_REPOSITORY_URI" | cut -d'/' -f1)"
+          cat > /tmp/ssm-params.json << SSMPARAMS
+          {
+            "commands": [
+              "set -euo pipefail",
+              "export AWS_DEFAULT_REGION=$AWS_REGION",
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "docker run -d --restart always --name app -p 80:8000 -e PORT=8000 -e BACKEND_PORT=8000 $IMAGE_URI"
+            ]
+          }
+          SSMPARAMS
+          cat /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "SSM command id: $COMMAND_ID"
+          STATUS=""
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "Status" --output text || echo "Pending")
+            echo "Attempt $i status: $STATUS"
+            case "$STATUS" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut) echo "SSM command failed"; exit 1 ;;
+            esac
+            sleep 5
+          done
+          [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed in time"; exit 1; }
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "StandardOutputContent" --output text
+
+  verify-production:
+    needs: [build-and-push, deploy-to-ec2]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check public URL until HTTP 200
+        run: |
+          set -euo pipefail
+          CODE=""
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /tmp/health.html -w '%{http_code}' "$PUBLIC_URL/" || true)
+            echo "Attempt $i HTTP status: $CODE"
+            [ "$CODE" = "200" ] && break
+            sleep 5
+          done
+          if [ "$CODE" != "200" ]; then
+            echo "Health check failed: expected HTTP 200, got '$CODE'"
+            exit 1
+          fi
+          echo "--- Response body (first 20 lines) ---"
+          head -n 20 /tmp/health.html
+          grep -qi "Rock Paper Scissor" /tmp/health.html && echo "Deployed content verified"
+          echo "Deployment verified at $PUBLIC_URL"
