@@ -95,10 +95,10 @@ jobs:
           export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="${AWS_REGION:-ap-south-1}"
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
@@ -106,56 +106,40 @@ jobs:
             ]
           }
           SSMPARAMS
-          echo "==> SSM parameters payload:"
-          cat /tmp/ssm-params.json
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_DEFAULT_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_DEFAULT_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
           for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_DEFAULT_REGION" \
-              --query "Status" --output text || echo "Pending")
-            echo "attempt=$i status=$STATUS"
-            if [ "$STATUS" = "Success" ]; then echo "SSM command succeeded"; exit 0; fi
-            case "$STATUS" in
-              Failed|Cancelled|TimedOut) echo "SSM command failed"; exit 1;;
-            esac
+            STATUS=$(aws ssm list-commands --command-id "$COMMAND_ID" --region "$AWS_DEFAULT_REGION" --query "Commands[0].Status" --output text)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then echo "Deploy command succeeded"; exit 0; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then echo "Deploy command failed"; exit 1; fi
             sleep 10
           done
-          echo "SSM command timed out"; exit 1
+          echo "Deploy command timed out"; exit 1
 
       - name: Verify deployment - health check expects HTTP 200
         run: |
           set -e
-          echo "Waiting for container to serve on $PUBLIC_URL ..."
+          echo "Waiting for container to become healthy on $PUBLIC_URL ..."
           for i in $(seq 1 30); do
-            HTTP_CODE=$(curl -s -o /tmp/response.html -w "%{http_code}" "$PUBLIC_URL" || true)
-            echo "attempt=$i http_code=$HTTP_CODE"
-            if [ "$HTTP_CODE" = "200" ]; then
+            CODE=$(curl -s -o /tmp/health.html -w '%{http_code}' "$PUBLIC_URL/" || true)
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
               echo "Health check passed"
-              grep -o '<title>[^<]*</title>' /tmp/response.html || true
+              grep -o '<title>[^<]*</title>' /tmp/health.html || true
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed - site not reachable"
+          echo "Health check failed - never received HTTP 200"
           exit 1
 
-      - name: Summary - target outputs
-        if: always()
-        run: |
-          echo "public_ip=13.204.136.169"
-          echo "public_url=http://13.204.136.169"
-          echo "alb_dns_name=13.204.136.169"
-          echo "instance_id=i-0636d6d516e700271"
-          echo "ecr_repo_url=759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati"
-          echo "security_group_id=sg-0bbe7f166528c56cd"
-          echo "iam_instance_profile=rock-paper-scissor-stati-instance-profile"
-          echo "iam_role=rock-paper-scissor-stati-ec2-role"
+    outputs:
+      public_ip: 13.204.136.169
+      public_url: http://13.204.136.169
+      alb_dns_name: 13.204.136.169
+      instance_id: i-0636d6d516e700271
+      ecr_repo_url: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati
+      security_group_id: sg-0bbe7f166528c56cd
+      iam_instance_profile: rock-paper-scissor-stati-instance-profile
+      iam_role: rock-paper-scissor-stati-ec2-role
