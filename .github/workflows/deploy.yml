@@ -108,8 +108,9 @@ jobs:
           SSMPARAMS
           COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_DEFAULT_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
+          sleep 5
           for i in $(seq 1 30); do
-            STATUS=$(aws ssm list-commands --command-id "$COMMAND_ID" --region "$AWS_DEFAULT_REGION" --query "Commands[0].Status" --output text)
+            STATUS=$(aws ssm list-command-invocations --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_DEFAULT_REGION" --query "CommandInvocations[0].Status" --output text)
             echo "SSM status: $STATUS"
             if [ "$STATUS" = "Success" ]; then echo "Deploy command succeeded"; exit 0; fi
             if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then echo "Deploy command failed"; exit 1; fi
@@ -120,9 +121,9 @@ jobs:
       - name: Verify deployment - health check expects HTTP 200
         run: |
           set -e
-          echo "Waiting for container to become healthy on $PUBLIC_URL ..."
+          echo "Waiting for container to become healthy on $PUBLIC_URL"
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health.html -w '%{http_code}' "$PUBLIC_URL/" || true)
+            CODE=$(curl -s -o /tmp/health.html -w '%{http_code}' "$PUBLIC_URL" || true)
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
               echo "Health check passed"
@@ -131,15 +132,17 @@ jobs:
             fi
             sleep 10
           done
-          echo "Health check failed - never received HTTP 200"
+          echo "Health check failed - no HTTP 200 received"
           exit 1
 
-    outputs:
-      public_ip: 13.204.136.169
-      public_url: http://13.204.136.169
-      alb_dns_name: 13.204.136.169
-      instance_id: i-0636d6d516e700271
-      ecr_repo_url: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati
-      security_group_id: sg-0bbe7f166528c56cd
-      iam_instance_profile: rock-paper-scissor-stati-instance-profile
-      iam_role: rock-paper-scissor-stati-ec2-role
+      - name: Emit deployment target outputs
+        run: |
+          set -e
+          echo "public_ip=13.204.136.169"
+          echo "public_url=http://13.204.136.169"
+          echo "alb_dns_name=13.204.136.169"
+          echo "instance_id=i-0636d6d516e700271"
+          echo "ecr_repo_url=759204735992.dkr.ecr.ap-south-1.amazonaws.com/rock-paper-scissor-stati"
+          echo "security_group_id=sg-0bbe7f166528c56cd"
+          echo "iam_instance_profile=rock-paper-scissor-stati-instance-profile"
+          echo "iam_role=rock-paper-scissor-stati-ec2-role"
